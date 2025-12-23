@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Chess + Stockfish — Advanced (Enter + Fokus)</title>
+<style>
+  body { font-family: system-ui, Arial; margin: 18px; }
+  #board { white-space: pre; font-family: monospace; background:#f7f7f7; padding:10px; border-radius:6px; min-height:80px; }
+  #controls { margin-top:12px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .group { background:#fff; padding:10px; border-radius:6px; box-shadow:0 1px 2px rgba(0,0,0,0.05); }
+  label { display:inline-block; margin-right:8px; font-weight:600; }
+  input[type="text"], input[type="number"], select { padding:6px; }
+  button { padding:6px 10px; }
+  pre#log { background:#0b0b0b; color:#b8f2b8; padding:10px; height:260px; overflow:auto; border-radius:6px; margin-top:12px; }
+  .small { font-size:0.9em; color:#444; }
+</style>
+</head>
+<body>
+  <h3>Chess + Stockfish — erweiterte Steuerung (Enter + Fokus)</h3>
+
+  <div id="board" aria-live="polite"></div>
+
+  <div id="controls">
+    <div class="group">
+      <div><label>Wer beginnt</label>
+        <select id="whoStarts">
+          <option value="player">Spieler (Weiß)</option>
+          <option value="engine">Engine (Weiß)</option>
+        </select>
+      </div>
+      <div class="small">Wähle, ob der Spieler oder die Engine die weißen Steine übernimmt.</div>
+    </div>
+
+    <div class="group">
+      <div><label>Movetime (ms)</label>
+        <input id="movetime" type="number" value="1000" min="50" step="50" style="width:90px"></div>
+      <div class="small">Zeit, die die Engine pro Zug verwendet (oder nutze Depth).</div>
+    </div>
+
+    <div class="group">
+      <div><label>Skill Level (1–20)</label>
+        <input id="skill" type="number" value="20" min="1" max="20" style="width:70px"></div>
+      <div><label>Threads</label>
+        <input id="threads" type="number" value="2" min="1" max="16" style="width:70px"></div>
+      <div><label>Hash (MB)</label>
+        <input id="hash" type="number" value="64" min="1" max="2048" style="width:90px"></div>
+      <div class="small">Erhöhe Threads/Hash für bessere Leistung (sofern RAM/CPU vorhanden).</div>
+    </div>
+
+    <div class="group">
+      <div><label>Auto Engine nach Spielerzug</label>
+        <input id="autoEngine" type="checkbox" checked></div>
+      <div><label>Auto Weiterspielen</label>
+        <input id="autoContinue" type="checkbox" checked></div>
+      <div class="small">AutoEngine: Engine rechnet sofort nach Spielerzug. AutoContinue: Engine macht Gegenzug automatisch.</div>
+    </div>
+
+    <div class="group">
+      <div><label>Zug (UCI oder SAN)</label>
+        <input id="moveInput" type="text" placeholder="z.B. e2e4 oder Nf3" style="width:140px"></div>
+      <div style="margin-top:6px">
+        <button id="makeMoveBtn">Zug ausführen</button>
+        <button id="engineMoveBtn">Engine Zug</button>
+        <button id="newGameBtn">Neue Partie</button>
+        <button id="startEngineBtn">Engine starten</button>
+        <button id="stopEngineBtn">Engine stoppen</button>
+      </div>
+    </div>
+  </div>
+
+  <h4>Log</h4>
+  <pre id="log"></pre>
+
+<script type="module">
+import * as ChessModule from './chess.min.js';
+const ChessCtor = ChessModule.default ?? ChessModule.Chess ?? ChessModule;
+
+// DOM
+const boardEl = document.getElementById('board');
+const logEl = document.getElementById('log');
+const moveInput = document.getElementById('moveInput');
+const makeMoveBtn = document.getElementById('makeMoveBtn');
+const engineMoveBtn = document.getElementById('engineMoveBtn');
+const newGameBtn = document.getElementById('newGameBtn');
+const startEngineBtn = document.getElementById('startEngineBtn');
+const stopEngineBtn = document.getElementById('stopEngineBtn');
+
+const movetimeInput = document.getElementById('movetime');
+const skillInput = document.getElementById('skill');
+const threadsInput = document.getElementById('threads');
+const hashInput = document.getElementById('hash');
+const autoEngineCheckbox = document.getElementById('autoEngine');
+const autoContinueCheckbox = document.getElementById('autoContinue');
+const whoStartsSelect = document.getElementById('whoStarts');
+
+function log(...args){ logEl.textContent += args.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+function clearLog(){ logEl.textContent = ''; }
+
+// Chess + Engine state
+let chess = new ChessCtor();
+let engine = null;
+let engineReady = false;
+let engineBusy = false;
+let expectingReady = false;
+let autoEngine = true;
+let autoContinue = true;
+let enginePlaysWhite = false;
+let lastIllegalBestmoveCount = 0; // Schutz gegen Loops
+
+// Render board (einfach)
+function renderBoard(){
+  boardEl.textContent = 'FEN: ' + chess.fen() + '\n\nZüge: ' + (chess.history().length ? chess.history().join(' ') : '(keine)');
+  // Fokus aufs Eingabefeld nach jedem Board-Update
+  focusMoveInput();
+}
+
+// Fokus-Funktion für das Eingabefeld
+function focusMoveInput(){ 
+  try { moveInput.focus(); } catch(e) { /* ignore */ }
+}
+
+// Konvertiert chess.history() in UCI-Moves (z.B. "e2e4 d7d5 d2d4 d5e4")
+function getUciMovesFromChess() {
+  const verbose = chess.history({ verbose: true });
+  return verbose.map(m => m.from + m.to + (m.promotion ? m.promotion : '')).join(' ');
+}
+
+// sendPositionToEngine: sendet korrekte UCI-Moves an Engine
+function sendPositionToEngine(){
+  if(!engine) return;
+  const uciMoves = getUciMovesFromChess();
+  if(!uciMoves) sendToEngine('position startpos');
+  else sendToEngine('position startpos moves ' + uciMoves);
+}
+
+// Robuste applyMove: akzeptiert UCI (e2e4) oder SAN (e4, Nf3)
+function applyMoveRaw(input){
+  const raw = String(input ?? '').trim();
+  if(!raw){ log('Kein Zug eingegeben'); return false; }
+  const move = raw.toLowerCase();
+
+  // UCI-Format prüfen: e2e4 oder e7e8q
+  if(/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move)){
+    const from = move.slice(0,2);
+    const to = move.slice(2,4);
+    const promotion = move.length === 5 ? move[4] : undefined;
+    // Prüfe Legalität
+    const legal = chess.moves({ verbose: true }).some(m => m.from === from && m.to === to && (promotion ? m.promotion === promotion : true));
+    if(!legal){
+      log('Ungültiger oder illegaler UCI-Zug für die aktuelle Stellung:', move);
+      return false;
+    }
+    const res = chess.move({ from, to, promotion });
+    if(!res){
+      log('chess.js konnte den UCI-Zug nicht ausführen:', move);
+      return false;
+    }
+    renderBoard();
+    return true;
+  }
+
+  // Versuch SAN
+  try {
+    const res = chess.move(move);
+    if(!res){
+      log('Ungültiger SAN-Zug oder nicht legal in dieser Stellung:', move);
+      return false;
+    }
+    renderBoard();
+    return true;
+  } catch(e){
+    log('Fehler beim Parsen des Zugs:', e.message);
+    return false;
+  }
+}
+
+// Engine-Kommunikation
+function sendToEngine(cmd){
+  if(!engine) return;
+  engine.postMessage(cmd);
+  log('> ' + cmd);
+}
+
+// Setze Engine-Optionen (nach uciok, vor isready)
+function setEngineOptions(){
+  const threads = parseInt(threadsInput.value, 10) || 1;
+  const hash = parseInt(hashInput.value, 10) || 16;
+  const skill = parseInt(skillInput.value, 10) || 20;
+  sendToEngine(`setoption name Threads value ${threads}`);
+  sendToEngine(`setoption name Hash value ${hash}`);
+  // Skill Level existiert nicht in allen Builds; senden ist in der Regel unproblematisch
+  sendToEngine(`setoption name Skill Level value ${skill}`);
+  sendToEngine('setoption name MultiPV value 1');
+}
+
+// Startet den Worker und initialisiert UCI
+function startEngine(){
+  if(engine) {
+    log('Engine läuft bereits');
+    return;
+  }
+  try {
+    engine = new Worker('./stockfish.js');
+  } catch(e){
+    log('Worker konnte nicht gestartet werden:', e.message);
+    engine = null;
+    return;
+  }
+
+  engineReady = false;
+  engineBusy = false;
+  expectingReady = false;
+  lastIllegalBestmoveCount = 0;
+
+  engine.onmessage = (ev) => {
+    const line = (ev.data ?? '').toString().trim();
+    log('< ' + line);
+
+    if(line === 'uciok'){
+      setEngineOptions();
+      sendToEngine('isready');
+      expectingReady = true;
+    } else if(line === 'readyok'){
+      engineReady = true;
+      expectingReady = false;
+      log('Engine ist ready');
+      // Wenn Engine als Weiß starten soll, und Engine spielt Weiß, starte sofort
+      if(enginePlaysWhite){
+        sendPositionToEngine();
+        startEngineSearch();
+      }
+    } else if(line.startsWith('info')){
+      // optional: parse score/pv falls gewünscht
+    } else if(line.startsWith('bestmove')){
+      engineBusy = false;
+      const parts = line.split(' ');
+      const best = parts[1];
+      if(!best || best === '(none)'){
+        log('Engine meldet keinen Zug');
+        return;
+      }
+      // Prüfe Legalität gegen die aktuelle Stellung (UCI-Vergleich)
+      const legal = chess.moves({ verbose: true }).some(m => (m.from + m.to + (m.promotion||'')) === best);
+      if(!legal){
+        log('Engine schlug illegalen Zug vor:', best);
+        lastIllegalBestmoveCount++;
+        // Schutz gegen Endlosschleife: nur begrenzt automatisch neu versuchen
+        if(lastIllegalBestmoveCount <= 2){
+          log('Resync: sende korrekte Stellung an Engine und starte einmalige stärkere Suche');
+          sendPositionToEngine();
+          sendToEngine('go depth 18'); // einmaliger Versuch
+        } else {
+          log('Mehrere illegale Vorschläge — Engine stoppen empfohlen oder Engine neu starten');
+        }
+        return;
+      }
+      // legal -> anwenden
+      const ok = applyMoveRaw(best);
+      if(!ok) {
+        log('Enginezug konnte nicht angewendet werden:', best);
+        return;
+      }
+      // Nach Enginezug: Engine und UI sind synchron.
+      lastIllegalBestmoveCount = 0;
+    }
+  };
+
+  // Start UCI
+  sendToEngine('uci');
+  log('Engine gestartet (UCI init)');
+}
+
+// Stoppt Engine
+function stopEngine(){
+  if(!engine) { log('Keine Engine aktiv'); return; }
+  try {
+    sendToEngine('quit');
+    engine.terminate();
+  } catch(e){
+    console.error(e);
+  }
+  engine = null;
+  engineReady = false;
+  engineBusy = false;
+  log('Engine gestoppt');
+}
+
+// Startet die Suche (movetime oder depth)
+function startEngineSearch(){
+  if(!engine || !engineReady) { log('Engine nicht bereit'); return; }
+  engineBusy = true;
+  const mt = parseInt(movetimeInput.value, 10) || 1000;
+  sendToEngine('go movetime ' + mt);
+}
+
+// UI-Event-Handler
+makeMoveBtn.addEventListener('click', () => {
+  const mv = moveInput.value.trim();
+  if(!mv) { log('Kein Zug eingegeben'); return; }
+  const ok = applyMoveRaw(mv);
+  if(!ok) return;
+  // Leere Eingabe nach Ausführung
+  moveInput.value = '';
+  // Nach Spielerzug: Engine synchronisieren
+  if(engine){
+    sendPositionToEngine();
+    // Wenn AutoEngine an und Engine ist am Zug, sofort rechnen
+    if(autoEngine){
+      enginePlaysWhite = (whoStartsSelect.value === 'engine');
+      const engineTurn = (enginePlaysWhite && chess.turn() === 'w') || (!enginePlaysWhite && chess.turn() === 'b');
+      if(engineTurn){
+        if(engineReady && !engineBusy){
+          startEngineSearch();
+        } else {
+          log('Engine noch nicht ready, warte auf readyok');
+        }
+      }
+    }
+  } else {
+    log('Keine Engine aktiv — Zug nur lokal ausgeführt');
+  }
+  // Fokus zurück auf Eingabefeld
+  focusMoveInput();
+});
+
+engineMoveBtn.addEventListener('click', () => {
+  if(!engine){
+    enginePlaysWhite = (whoStartsSelect.value === 'engine');
+    startEngine();
+    setTimeout(() => {
+      if(engineReady){
+        sendPositionToEngine();
+        startEngineSearch();
+      }
+    }, 300);
+  } else {
+    sendPositionToEngine();
+    startEngineSearch();
+  }
+});
+
+newGameBtn.addEventListener('click', () => {
+  chess = new ChessCtor();
+  renderBoard();
+  clearLog();
+  log('Neue Partie gestartet');
+  enginePlaysWhite = (whoStartsSelect.value === 'engine');
+  // Wenn Engine läuft und Engine soll Weiß sein, starte Enginezug
+  if(engine && enginePlaysWhite && engineReady){
+    sendPositionToEngine();
+    startEngineSearch();
+  }
+  // Fokus aufs Eingabefeld
+  focusMoveInput();
+});
+
+startEngineBtn.addEventListener('click', () => {
+  enginePlaysWhite = (whoStartsSelect.value === 'engine');
+  startEngine();
+});
+
+stopEngineBtn.addEventListener('click', () => {
+  stopEngine();
+});
+
+whoStartsSelect.addEventListener('change', () => {
+  enginePlaysWhite = (whoStartsSelect.value === 'engine');
+});
+
+autoEngineCheckbox.addEventListener('change', () => { autoEngine = autoEngineCheckbox.checked; });
+autoContinueCheckbox.addEventListener('change', () => { autoContinue = autoContinueCheckbox.checked; });
+
+// Enter im Eingabefeld sendet den Zug und verhindert Default
+moveInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    makeMoveBtn.click();
+  }
+});
+
+// Initialisierung
+renderBoard();
+log('Chess geladen. Start-FEN:');
+log(chess.fen());
+log('Wähle Einstellungen und klicke "Engine starten".');
+
+</script>
+</body>
+</html>
